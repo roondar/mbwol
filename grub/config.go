@@ -4,31 +4,31 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	"log/slog"
+
 	"os"
 	"sync"
 	"time"
 )
 
 const (
-	ERR_HOST_NOT_FOUND = "host_not_found"
+	ERR_HOST_NOT_FOUND   = "host_not_found"
 	ERR_CONFIG_NOT_FOUND = "config_not_found"
 )
 
 type Host struct {
-	ID string `json:"id"`
-	IP string `json:"ip"`
-	BroadcastIP *string `json:"broadcastIp,omitempty"`
-	MacAddress string `json:"macAddress"`
-	Configs map[string]string `json:"configs"`
+	ID            string            `json:"id"`
+	IP            string            `json:"ip"`
+	BroadcastIP   *string           `json:"broadcastIp,omitempty"`
+	MacAddress    string            `json:"macAddress"`
+	Configs       map[string]string `json:"configs"`
 	CurrentConfig *string
-	LastSetAt *time.Time
-	Timeout uint8 `json:"timeout"`
-	ResetAfterGet bool `json:"resetAfterGet"`
+	LastSetAt     *time.Time
+	Timeout       uint8 `json:"timeout"`
+	ResetAfterGet bool  `json:"resetAfterGet"`
 }
 
 type HostConfigs struct {
-	mu sync.Mutex
+	mu    sync.Mutex
 	Hosts map[string]Host `json:"hosts"`
 }
 
@@ -40,73 +40,46 @@ var hc *HostConfigs
 
 func InitHostConfigs(configPath string) {
 	// Parse config file
-    data, err := os.ReadFile(configPath)
-    if err != nil {
-        log.Fatalf("Error reading the config file : %s", err.Error())
-    }
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Fatalf("Error reading the config file : %s", err.Error())
+	}
 
-    var jsonConfig JsonConfig
-    err = json.Unmarshal(data, &jsonConfig)
-    if err != nil {
-			log.Fatalf("Error parsing the config file : %s", err.Error())
-    }
+	var jsonConfig JsonConfig
+	err = json.Unmarshal(data, &jsonConfig)
+	if err != nil {
+		log.Fatalf("Error parsing the config file : %s", err.Error())
+	}
 
-    hc = &HostConfigs{Hosts: jsonConfig.Hosts}
-    
+	hc = &HostConfigs{Hosts: jsonConfig.Hosts}
+
 }
 
 // Returns the currentConfig for the host
 // Returns an empty string if the host is not found
-func GetConfigByIp(clientIp string) string {
-
+func GetConfigByIp(clientIp string) (string, func()) {
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	
-	var hostId string
-	hostFound := false
-
-	for id, c := range(hc.Hosts) {
-		if c.IP == clientIp {
-			hostFound = true
-			hostId = id
-			break
+	for id, host := range hc.Hosts {
+		if host.IP != clientIp || host.CurrentConfig == nil {
+			continue
+		}
+		if host.Timeout != 0 && host.LastSetAt != nil &&
+			time.Since(*host.LastSetAt) > time.Duration(host.Timeout)*time.Second {
+			return "", func() {}
+		}
+		selection := host.CurrentConfig
+		return host.Configs[*selection], func() {
+			hc.mu.Lock()
+			defer hc.mu.Unlock()
+			current := hc.Hosts[id]
+			if current.ResetAfterGet && current.CurrentConfig == selection {
+				current.CurrentConfig = nil
+				hc.Hosts[id] = current
+			}
 		}
 	}
-
-	if !hostFound {
-		slog.Debug("No config found for this host")
-		return ""
-	}
-
-	host := hc.Hosts[hostId]
-
-	if host.CurrentConfig == nil {
-		slog.Debug("No current config, returning empty string")
-		return ""
-	}
-
-	configContent := host.Configs[*host.CurrentConfig]
-
-	t := time.Now()
-	defer func () {
-		host.LastSetAt = &t
-		if host.ResetAfterGet {
-			host.CurrentConfig = nil
-		}
-		hc.Hosts[host.ID] = host
-
-	}()
-
-	if host.LastSetAt == nil || host.Timeout == 0 {
-		return configContent
-	}
-
-	if time.Since(*host.LastSetAt).Seconds() <= float64(host.Timeout) {
-		return configContent
-	}
-
-	slog.Debug("Timeout expired, returning empty config")
-	return ""
+	return "", func() {}
 }
 
 func SetCurrentConfig(hostId string, configName string) error {
@@ -141,4 +114,3 @@ func GetHostById(hostId string) (*Host, error) {
 	}
 	return &host, nil
 }
-
