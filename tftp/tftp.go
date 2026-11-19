@@ -54,13 +54,17 @@ func ListenAndServeTFTP() error {
 		n, clientAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			slog.Error("Error reading from UDP", "err", err.Error())
+			continue
 		}
 
 		slog.Debug("Received packet", "from", clientAddr.String(), "size", n)
-		opcode := int(buffer[1])
+		if n < 2 {
+			continue
+		}
+		opcode := int(binary.BigEndian.Uint16(buffer[:2]))
 		switch opcode {
 		case OPCODE_RRQ:
-			go handleRRQ(buffer, clientAddr)
+			go handleRRQ(buffer[:n], clientAddr)
 		default:
 			slog.Warn("Unsupported opcode", "opcode", opcode)
 		}
@@ -69,19 +73,11 @@ func ListenAndServeTFTP() error {
 
 func handleRRQ(packet []byte, clientAddr *net.UDPAddr) {
 	parts := bytes.Split(packet[2:], []byte{0})
-	filename := parts[0]
-	slog.Debug("RRQ received", "filename", string(filename), "client", clientAddr.IP.String())
-	slog.Debug("Parts", "parts", parts)
-	for _, part := range parts {
-		if len(part) == 0 {
-			continue
-		}
-		slog.Debug("Part", "part", string(part))
+	if len(parts) < 3 || len(parts[len(parts)-1]) != 0 || len(parts)%2 == 0 {
+		return
 	}
-	content := grub.GetConfigByIp(clientAddr.IP.String())
-	slog.Debug("Retreived content", "content", content)
+	content, complete := grub.GetConfigByIp(clientAddr.IP.String())
 	data := []byte(content)
-	block := 1
 	udpConn, err := net.DialUDP("udp", nil, clientAddr)
 	conn := Connection{
 		Conn:      udpConn,
@@ -95,106 +91,73 @@ func handleRRQ(packet []byte, clientAddr *net.UDPAddr) {
 	defer udpConn.Close()
 
 	// Handle options
-	err = handleOptions(parts[2:], &conn)
+	err = handleOptions(parts[2:len(parts)-1], &conn)
+	if err == nil {
+		err = sendData(data, &conn)
+	}
 	if err != nil {
-		slog.Error("Error handling options", "err", err.Error())
+		slog.Debug("TFTP transfer incomplete", "err", err)
 		return
 	}
-
-	sendData(data, &conn, block)
+	complete()
 }
 
 func handleOptions(options [][]byte, conn *Connection) error {
-	// No options
-	if len(options[0]) == 0 {
+	packet := []byte{0, OPCODE_OACK}
+	for i := 0; i < len(options); i += 2 {
+		name, value := string(options[i]), string(options[i+1])
+		switch name {
+		case "tsize":
+			value = strconv.FormatInt(conn.DataLen, 10)
+		case "blksize":
+			size, err := strconv.Atoi(value)
+			if err != nil || size < 8 || size > 65464 {
+				continue
+			}
+			conn.BlockSize = size
+		default:
+			continue
+		}
+		packet = append(packet, name...)
+		packet = append(packet, 0)
+		packet = append(packet, value...)
+		packet = append(packet, 0)
+	}
+	if len(packet) == 2 {
 		return nil
 	}
-
-	opts := make(map[string]string)
-
-	oackPacket := []byte{0, byte(OPCODE_OACK)}
-
-	for i, option := range options {
-		if i%2 == 0 && string(option) != "" {
-			slog.Debug("Option", "option", string(option))
-			switch string(option) {
-			case "tsize":
-				slog.Debug("Tsize option", "tsize", string(options[i+1]))
-				opts["tsize"] = strconv.FormatInt(conn.DataLen, 10)
-			case "blksize":
-				blockSizeStr := string(options[i+1])
-				slog.Debug("Block size option", "blockSize", blockSizeStr)
-				size, err := strconv.Atoi(blockSizeStr)
-				if err != nil {
-					slog.Error("Invalid blksize value", "value", blockSizeStr, "err", err)
-				} else {
-					conn.BlockSize = size
-					opts["blksize"] = blockSizeStr
-				}
-			}
-		}
-		// Ignore other options
-	}
-
-	for key, value := range opts {
-		oackPacket = append(oackPacket, []byte(key)...)
-		oackPacket = append(oackPacket, 0)
-		oackPacket = append(oackPacket, []byte(value)...)
-		oackPacket = append(oackPacket, 0)
-	}
-
-	_, err := conn.Conn.Write(oackPacket)
-	if err != nil {
-		slog.Error("Error sending OACK packet", "err", err.Error())
+	if _, err := conn.Conn.Write(packet); err != nil {
 		return err
 	}
+	return expectACK(conn.Conn, 0)
+}
 
-	ackPacket, err := receivePacket(conn.Conn)
+func expectACK(conn *net.UDPConn, block uint16) error {
+	packet, err := receivePacket(conn)
 	if err != nil {
-		slog.Error("Error receiving ACK packet:", "err", err)
 		return err
 	}
-	if ackPacket.Opcode != OPCODE_ACK {
-		slog.Error("Expected ACK packet", "receivedOpcode", ackPacket.Opcode)
-		return fmt.Errorf("expected ACK packet, received opcode %d", ackPacket.Opcode)
+	if packet.Opcode != OPCODE_ACK || len(packet.Payload) != 2 ||
+		binary.BigEndian.Uint16(packet.Payload) != block {
+		return fmt.Errorf("unexpected TFTP response for block %d", block)
 	}
-	slog.Debug("Received ACK")
 	return nil
 }
 
-func sendData(data []byte, conn *Connection, blockNumber int) error {
-	start := (blockNumber - 1) * conn.BlockSize
-	end := start + conn.BlockSize
-	if end > len(data) {
-		end = len(data)
+func sendData(data []byte, conn *Connection) error {
+	for block := uint16(1); ; block++ {
+		size := min(len(data), conn.BlockSize)
+		if _, err := conn.Conn.Write(createDataPacket(int(block), data[:size])); err != nil {
+			return err
+		}
+		if err := expectACK(conn.Conn, block); err != nil {
+			return err
+		}
+		if size < conn.BlockSize {
+			return nil
+		}
+		data = data[size:]
 	}
-	blockData := data[start:end]
-	packet := createDataPacket(blockNumber, blockData)
-	slog.Debug("Sending packet", "packet", packet)
-	_, err := conn.Conn.Write(packet)
-	if err != nil {
-		slog.Error("Error sending data packet", "err", err.Error())
-		return err
-	}
-
-	ackPacket, err := receivePacket(conn.Conn)
-	if err != nil {
-		slog.Error("Error receiving ACK packet:", "err", err)
-		return err
-	}
-	if ackPacket.Opcode != OPCODE_ACK {
-		slog.Error("Expected ACK packet", "receivedOpcode", ackPacket.Opcode)
-		return fmt.Errorf("expected ACK packet, received opcode %d", ackPacket.Opcode)
-	}
-	slog.Debug("Received ACK")
-
-	if len(data) == end {
-		return nil
-	}
-
-	next := binary.BigEndian.Uint16(ackPacket.Payload[0:2])
-
-	return sendData(data, conn, int(next))
 }
 
 func createDataPacket(blockNumber int, data []byte) []byte {
@@ -227,7 +190,10 @@ func receivePacket(conn *net.UDPConn) (*TFTPPacket, error) {
 		return nil, err
 	}
 
-	opcode := int(buffer[1])
+	if n < 2 {
+		return nil, errors.New("short TFTP response")
+	}
+	opcode := int(binary.BigEndian.Uint16(buffer[:2]))
 	payload := buffer[2:n]
 	return &TFTPPacket{Opcode: opcode, Payload: payload}, nil
 }
